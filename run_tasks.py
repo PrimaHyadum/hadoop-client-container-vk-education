@@ -5,9 +5,13 @@ import sys
 
 HDFS_URI = "hdfs://192.168.34.2:8020"
 HADOOP_HOME = os.environ.get("HADOOP_HOME", "/opt/hadoop")
-EXAMPLES_JAR = os.path.join(HADOOP_HOME, "share", "hadoop", "mapreduce", "hadoop-mapreduce-examples-3.3.6.jar")
+EXAMPLES_JAR = os.path.join(
+    HADOOP_HOME,
+    "share", "hadoop", "mapreduce",
+    "hadoop-mapreduce-examples-3.3.6.jar"
+)
 
-def sh(cmd, check=False, capture=False):
+def run(cmd, check=True, capture=False):
     print("+", cmd)
     res = subprocess.run(cmd, shell=True, text=True,
                          stdout=(subprocess.PIPE if capture else None),
@@ -16,76 +20,63 @@ def sh(cmd, check=False, capture=False):
         out = res.stdout or ""
     else:
         out = ""
-    if res.returncode != 0:
-        print("COMMAND FAILED (code {}):".format(res.returncode))
-        print(res.stdout if res.stdout is not None else "")
-        if check:
-            sys.exit(2)
-    return res.returncode, out
+    if check and res.returncode != 0:
+        print("ERROR:", out)
+        sys.exit(1)
+    return out
 
-def ensure_createme():
-    # -p to avoid error when exists
-    sh(f"hdfs dfs -mkdir -p {HDFS_URI}/createme", check=True)
+def safe_rm(path):
+    run(f"hdfs dfs -rm -r -skipTrash {path} || true", check=False)
 
-def ensure_delme_absent():
-    # remove if present; ignore error if not present
-    sh(f"hdfs dfs -rm -r -skipTrash {HDFS_URI}/delme || true")
+def safe_rm_file(path):
+    run(f"hdfs dfs -rm -f {path} || true", check=False)
 
-def create_nonnull():
-    local_tmp = "/tmp/tempfile.txt"
-    with open(local_tmp, "w") as f:
-        f.write("Hello Hadoop from Docker container!\n")
-    # Remove target if exists, then put
-    sh(f"hdfs dfs -rm -f {HDFS_URI}/nonnull.txt || true")
-    sh(f"hdfs dfs -put {local_tmp} {HDFS_URI}/nonnull.txt", check=True)
+def step1_create_dir():
+    run(f"hdfs dfs -mkdir -p {HDFS_URI}/createme")
 
-def run_wordcount():
+def step2_delete_dir():
+    safe_rm(f"{HDFS_URI}/delme")
+
+def step3_create_file():
+    tmp_file = "/tmp/nonnull.txt"
+    with open(tmp_file, "w") as f:
+        f.write("Some content\n")
+    safe_rm_file(f"{HDFS_URI}/nonnull.txt")
+    run(f"hdfs dfs -put {tmp_file} {HDFS_URI}/nonnull.txt")
+
+def step4_run_wordcount():
     if not os.path.exists(EXAMPLES_JAR):
-        print("ERROR: examples jar not found at", EXAMPLES_JAR)
-        sys.exit(3)
+        print(f"ERROR: {EXAMPLES_JAR} not found")
+        sys.exit(2)
 
-    input_file = f"{HDFS_URI}/shadow.txt"
-    output_dir = f"{HDFS_URI}/wordcount_output"
+    output_dir = f"{HDFS_URI}/wc_out"
+    safe_rm(output_dir)
 
-    # remove previous output (ignore error)
-    sh(f"hdfs dfs -rm -r -skipTrash {output_dir} || true")
+    run(f"hadoop jar {EXAMPLES_JAR} wordcount "
+        f"{HDFS_URI}/shadow.txt {output_dir}")
 
-    # run job and fail if non-zero
-    rc, _ = sh(f"hadoop jar {EXAMPLES_JAR} wordcount {input_file} {output_dir}", check=True)
-    # after run, verify output exists
-    rc, _ = sh(f"hdfs dfs -ls {output_dir} || true", check=True)
-
-def extract_and_write_innsmouth():
-    part = f"{HDFS_URI}/wordcount_output/part-r-00000"
-    rc, out = sh(f"hdfs dfs -cat {part}", check=False, capture=True)
+def step5_write_innsmouth_count():
+    output_file = f"{HDFS_URI}/wc_out/part-r-00000"
+    text = run(f"hdfs dfs -cat {output_file}", capture=True, check=False)
     count = "0"
-    if rc == 0 and out:
-        for line in out.splitlines():
-            parts = line.split('\t')
-            if len(parts) >= 2 and parts[0] == "Innsmouth":
-                count = parts[1].strip()
-                break
-    else:
-        print("WARN: could not cat part file; treating count as 0")
-
-    # write to local tmp and then put (overwrite)
-    local = "/tmp/count.txt"
-    with open(local, "w") as f:
-        f.write(str(count) + "\n")
-
-    sh(f"hdfs dfs -rm -f {HDFS_URI}/whataboutinsmouth.txt || true")
-    sh(f"hdfs dfs -put {local} {HDFS_URI}/whataboutinsmouth.txt", check=True)
-    # sanity check
-    sh(f"hdfs dfs -cat {HDFS_URI}/whataboutinsmouth.txt", check=True)
+    for line in text.splitlines():
+        parts = line.strip().split()
+        if len(parts) == 2 and parts[0] == "Innsmouth":
+            count = parts[1]
+            break
+    tmp_file = "/tmp/whataboutinsmouth.txt"
+    with open(tmp_file, "w") as f:
+        f.write(count + "\n")
+    safe_rm_file(f"{HDFS_URI}/whataboutinsmouth.txt")
+    run(f"hdfs dfs -put {tmp_file} {HDFS_URI}/whataboutinsmouth.txt")
 
 def main():
-    ensure_createme()
-    ensure_delme_absent()
-    create_nonnull()
-    run_wordcount()
-    extract_and_write_innsmouth()
-    print("ALL TASKS COMPLETED")
-    return 0
+    step1_create_dir()
+    step2_delete_dir()
+    step3_create_file()
+    step4_run_wordcount()
+    step5_write_innsmouth_count()
+    print("=== All tasks completed successfully ===")
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
